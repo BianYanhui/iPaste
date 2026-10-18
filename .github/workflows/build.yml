@@ -1,0 +1,168 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iPaste.app (macOS)
+    runs-on: macos-15
+    env:
+      # Stable self-signed identity (see docs/CODE_SIGNING.md / README).
+      IPASTE_SIGN_IDENTITY: "iPaste Self-Signed"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Self-test copy and update logic
+        run: python3 Support/scripts/selftest_update_logic.py
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build (unsigned, universal)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project iPaste.xcodeproj \
+            -scheme iPaste \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Import signing certificate
+        id: import_cert
+        env:
+          P12_BASE64: ${{ secrets.IPASTE_SIGNING_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.IPASTE_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_BASE64:-}" ] || [ -z "${P12_PASSWORD:-}" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No signing secrets — non-release builds fall back to ad-hoc. Set IPASTE_SIGNING_CERTIFICATE_P12 and IPASTE_SIGNING_CERTIFICATE_PASSWORD (docs/CODE_SIGNING.md). Tag builds refuse to publish an ad-hoc zip."
+            exit 0
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/ipaste-codesign.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/ipaste-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo "$P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          # Ephemeral keychain for this job only.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" \
+            -P "$P12_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | sed -e s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "Signing certificate imported."
+
+      - name: Sign and zip
+        env:
+          DID_IMPORT: ${{ steps.import_cert.outputs.signed }}
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release/iPaste.app"
+          test -d "$APP"
+
+          if [ "${DID_IMPORT}" = "true" ]; then
+            echo "=== Stable identity sign: $IPASTE_SIGN_IDENTITY ==="
+            # Self-signed: omit --options runtime (hardened runtime needs a
+            # proper Apple cert). Deep sign keeps nested binaries aligned.
+            codesign --force --deep --sign "$IPASTE_SIGN_IDENTITY" \
+              --timestamp=none \
+              "$APP"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::Refusing to publish an ad-hoc signed iPaste.zip. Ad-hoc loses Input Monitoring / TCC on every update. Set IPASTE_SIGNING_CERTIFICATE_P12 and IPASTE_SIGNING_CERTIFICATE_PASSWORD."
+            exit 1
+          else
+            echo "::warning::Ad-hoc sign (fallback for this non-release build only)"
+            codesign --force --deep --sign - "$APP"
+          fi
+
+          echo "=== codesign -dv --verbose=4 ==="
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee codesign-verify.txt
+          codesign --verify --verbose=4 "$APP"
+          if [ "${DID_IMPORT}" = "true" ]; then
+            if grep -q "Signature=adhoc" codesign-verify.txt; then
+              echo "::error::Expected stable identity, got ad-hoc"
+              exit 1
+            fi
+            if ! grep -q "iPaste Self-Signed" codesign-verify.txt; then
+              echo "::error::Authority is not iPaste Self-Signed"
+              exit 1
+            fi
+          fi
+          lipo -info "$APP/Contents/MacOS/iPaste"
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" iPaste.zip
+          ls -lh iPaste.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: iPaste.zip
+          path: iPaste.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload codesign log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codesign-verify
+          path: codesign-verify.txt
+          if-no-files-found: ignore
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DID_IMPORT: ${{ steps.import_cert.outputs.signed }}
+        run: |
+          if [ "${DID_IMPORT}" != "true" ]; then
+            echo "::error::Refusing to attach an ad-hoc iPaste.zip to the release."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" iPaste.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" iPaste.zip --title "iPaste $GITHUB_REF_NAME" --generate-notes
+          fi
